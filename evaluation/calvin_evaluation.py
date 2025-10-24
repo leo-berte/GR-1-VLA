@@ -166,6 +166,8 @@ class GR1CalvinEvaluation(CalvinBaseModel):
         # Attention mask
         attention_mask = torch.zeros(1, self.seq_len).long()
         attention_mask[0, :buffer_len] = 1
+        # 1 → timestep is valid, contains real observations and states
+        # 0 → timestep is padding (not enough history yet)
 
         # Forward pass
         tokenized_text = tokenized_text.to(self.device)
@@ -207,3 +209,5 @@ class GR1CalvinEvaluation(CalvinBaseModel):
         self.rollout_step_counter += 1
     
         return action_pred
+
+
