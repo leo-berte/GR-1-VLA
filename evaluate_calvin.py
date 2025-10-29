@@ -169,7 +169,9 @@ def main():
 
     with open(args.configs_path, "r") as f:
         variant = json.load(f)
+    
     device = torch.device('cuda', args.device)
+
     model = GR1CalvinEvaluation(
         mae_ckpt=args.mae_ckpt_path,
         policy_ckpt=args.policy_ckpt_path,

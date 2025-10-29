@@ -27,9 +27,13 @@ from models.transformer_utils import get_2d_sincos_pos_embed
 
 # 1) compara gestione history col mio
 # 2) compara gestione pos/temporal encoding per la history + spatial encoding images (sinusoid Vs learned)
-# 3) capire beneficio della predizione delle OBS (in aprticolare capire numero param modello e quali sono scelte che lo renderanno + lento in inference)
-# 4) capire se/come fargi generare action chunck
-# 5) self.fwd_pred e self.act_pred cosa comportano se le metto on/off? posso comunque usare stesso modello per train/inf o devo caricare altri pesi poi?
+# 3) capire numero param modello e quali sono scelte che lo renderanno + lento in inference
+# 4) aggiungo flow match heads
+# 6) aggiungo gestione N camere --> vedi foto
+# 7) capire come gestire correttamente casual mask con history
+
+
+# capire gli altri files in models che cazzo servono 
 
 
 
@@ -203,7 +207,7 @@ class GR1(nn.Module):
                 hand_rgb.view(batch_size*sequence_length, c, h, w))
             hand_obs_embeddings = hand_obs_embeddings.view(batch_size, sequence_length, -1)  # (b, l, img_feat_dim)
         
-        # ????
+        # Prepare the image labels for future MSE pixel loss
         if self.fwd_pred:
             p = self.patch_size
             h_p = h // p
@@ -262,7 +266,7 @@ class GR1(nn.Module):
         # time_embeddings: (l, 1, h)
         # --> PyTorch automatically expands time_embeddings to (b, l, n_patch_latents, h)
 
-        # Format sequence: lang, state, patch, obs, hand_patch, hand_obs, [ACT], [OBS], [OBS_HAND]
+        # Format sequence for single timestamp: (lang, state, patch, obs, hand_patch, hand_obs, [ACT], [OBS], [OBS_HAND])_i_th
         lang_embeddings = lang_embeddings.view(batch_size, sequence_length, 1, self.hidden_size)
         state_embeddings = state_embeddings.view(batch_size, sequence_length, 1, self.hidden_size)
         obs_embeddings = obs_embeddings.view(batch_size, sequence_length, 1, self.hidden_size)
@@ -277,12 +281,14 @@ class GR1(nn.Module):
                 (stacked_inputs,
                  hand_patch_embeddings, 
                  hand_obs_embeddings), dim=2)  # (b, l, n_tokens, h)
-        if self.act_pred: # add token for action prediction
+        if self.act_pred: # add token for action prediction (repeated for each timestamp)
             action_queries = self.action_queries.weight  # (1, h)
+            # .repeat() --> it expands the first two dimensions by copying the same content
             action_queries = action_queries.view(1, 1, 1, self.hidden_size).repeat(batch_size, sequence_length, 1, 1)  # (b, l, 1, h)
             stacked_inputs = torch.cat((stacked_inputs, action_queries), dim=2)  # (b, l, n_tokens, h)
-        if self.fwd_pred: # add token for OBS predictions
+        if self.fwd_pred: # add token for OBS predictions (repeated for each timestamp)
             obs_queries = self.obs_queries.weight  # (n_patch_latents + 1, h)
+            # .repeat() --> it expands the first two dimensions by copying the same content
             obs_queries = obs_queries.view(1, 1, self.n_patch_latents + 1, self.hidden_size).repeat(batch_size, sequence_length, 1, 1)  # (b, l, n_patch_latents + 1, h)
             stacked_inputs = torch.cat((stacked_inputs, obs_queries), dim=2)
             if self.fwd_pred_hand:
@@ -327,28 +333,54 @@ class GR1(nn.Module):
         # Attention mask to handle 1)
         # Each timestep t doesn’t have just one token, it has many.
         # .repeat(...) copies the same validity mask for every token type at that timestep.
-
+        
         if self.use_hand_rgb:
             stacked_attention_mask = stacked_attention_mask.repeat( 
                 1, 1, n_lang_tokens + n_state_tokens + n_hand_patch_tokens + n_hand_obs_tokens + n_patch_tokens + n_obs_tokens) # b, l, n_tokens
         else:
             stacked_attention_mask = stacked_attention_mask.repeat(
-                1, 1, n_lang_tokens + n_state_tokens + n_patch_tokens + n_obs_tokens)
-            
+                1, 1, n_lang_tokens + n_state_tokens + n_patch_tokens + n_obs_tokens) # b, l, n_tokens
+
+        # example with mask = (1, 5, 5):
+        # mask = [
+        #    [[1,1,1,1,1],
+        #     [1,1,1,1,1],
+        #     [1,1,1,1,1],
+        #     [0,0,0,0,0],
+        #     [0,0,0,0,0]]
+        # ]
+        # --> only timesteps t₁..t₃ have all 5 token types valid
+
         # Attention mask to handle 2)
         # [ACT] / [OBS] can see history to make predictions, but themselves don’t contribute as real input to future timesteps
-        # ????? da capire meglio questa cosa sopra
+        # So I set them to zero in the mask all the tokens related to ACT, OBS
 
         if self.act_pred:
-            act_query_attention_mask = torch.zeros((batch_size, sequence_length, n_act_pred_tokens), dtype=torch.long).cuda()
+            act_query_attention_mask = torch.zeros((batch_size, sequence_length, n_act_pred_tokens), dtype=torch.long).cuda() # b, l, 1
             stacked_attention_mask = torch.cat((stacked_attention_mask, act_query_attention_mask), dim=2) # stack along token space
         if self.fwd_pred:
-            obs_query_attention_mask = torch.zeros((batch_size, sequence_length, n_patch_tokens + n_obs_tokens), dtype=torch.long).cuda()
+            obs_query_attention_mask = torch.zeros((batch_size, sequence_length, n_patch_tokens + n_obs_tokens), dtype=torch.long).cuda() # b, l, n_OBS_tokens
             stacked_attention_mask = torch.cat((stacked_attention_mask, obs_query_attention_mask), dim=2) # stack along token space
             if self.fwd_pred_hand:
                 obs_hand_query_attention_mask = torch.zeros((batch_size, sequence_length, n_patch_tokens + n_obs_tokens), dtype=torch.long).cuda()
                 stacked_attention_mask = torch.cat((stacked_attention_mask, obs_hand_query_attention_mask), dim=2)
+
+        # example with mask (1, 5, 9) by adding ACT, OBS tokens: 
+        # mask = [
+        #    [[1,1,1,1,1,0,0,0,0],
+        #     [1,1,1,1,1,0,0,0,0],
+        #     [1,1,1,1,1,0,0,0,0],
+        #     [0,0,0,0,0,0,0,0,0],
+        #     [0,0,0,0,0,0,0,0,0]]
+        # ]
+
+        # flatten to pass it to GPT like this: [1,1,1,1,1,0,0,0,0,  1,1,1,1,1,0,0,0,0,  1,1,1,1,1,0,0,0,0,  0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0]
         stacked_attention_mask = stacked_attention_mask.reshape(batch_size, n_tokens * sequence_length)
+
+        # inside, the GPT will transform that HF mask in the real one used in attention formula (dim: SEQ_LEN x SEQ_LEN)
+
+        # the casual triangular mask built internally, seems not to enable tokens (i.e. PATCH_11) from same timestamp to consider the weight from
+        # other tokens belonging to same timestamp (i.e. PATCH_15)
 
         # GPT forward pass
         transformer_outputs = self.transformer(
@@ -360,7 +392,8 @@ class GR1(nn.Module):
 
         # Action prediction
         if self.act_pred:
-            action_embedding = x[:, :, act_query_token_start_i]
+            # extract ACT token and forecast action
+            action_embedding = x[:, :, act_query_token_start_i] # (b, l, hidden_size) 
             for pred_act_mlp in self.pred_act_mlps:
                 action_embedding = pred_act_mlp(action_embedding)
             arm_action_preds = self.pred_arm_act(action_embedding)  # (b, l, act_dim - 1)
@@ -368,19 +401,20 @@ class GR1(nn.Module):
             
         # Forward prediction
         if self.fwd_pred:
+            # The model copies this same learned vector for every patch position that needs to be reconstructed (for each timestamp)
             mask_token = self.mask_token  # (1, 1, 1, h)
             mask_tokens = mask_token.repeat(batch_size, sequence_length, (self.image_size//self.patch_size)**2, 1)  # (b, l, n_patches, h)
-            mask_tokens = mask_tokens + self.decoder_pos_embed.unsqueeze(0).repeat(batch_size, sequence_length, 1, 1)  # (b, l, n_patches, h)
-
+            mask_tokens = mask_tokens + self.decoder_pos_embed.unsqueeze(0).repeat(batch_size, sequence_length, 1, 1)  # (b, l, n_patches, h) + (b, l, n_patches, h)
+            # extract OBS tokens and forecast future OBS
             obs_pred = self.decoder_embed(x[:, :, obs_query_token_start_i:(obs_query_token_start_i + self.n_patch_latents + n_obs_tokens)])  # (b, l, n_patch_latents + 1, h)
-            obs_pred_ = torch.cat([obs_pred, mask_tokens], dim=2)  # (b, l, n_patches + n_patch_latens + 1, h)
-            obs_pred_ = obs_pred_.reshape(-1, obs_pred_.shape[-2], obs_pred_.shape[-1])  # (b * l, n_patches + n_patch_latens + 1, h)
+            obs_pred_ = torch.cat([obs_pred, mask_tokens], dim=2)  # (b, l, n_patch_latens + 1 + n_patches, h) --> [OBS_QUERY_1, OBS_QUERY_2, ..., MASK_PATCH_1, MASK_PATCH_2, ...]
+            obs_pred_ = obs_pred_.reshape(-1, obs_pred_.shape[-2], obs_pred_.shape[-1])  # (b * l, n_patch_latens + 1 + n_patches, h)
             for blk in self.decoder_blocks:
                 obs_pred_ = blk(obs_pred_)
             obs_pred_ = self.decoder_norm(obs_pred_)
-            obs_preds = self.decoder_pred(obs_pred_)  # (b * l, n_patches + n_patch_latens + 1, h)
-            obs_preds = obs_preds.reshape(batch_size, sequence_length, -1, obs_preds.shape[-1])  # (b, l, n_patches + n_patch_latens + 1, h)
-            obs_preds = obs_preds[:, :, (self.n_patch_latents+n_obs_tokens):]  # (b, l, n_patches, h)
+            obs_preds = self.decoder_pred(obs_pred_)  # (b * l, n_patch_latens + 1 + n_patches, patch_size**2 * 3)   
+            obs_preds = obs_preds.reshape(batch_size, sequence_length, -1, obs_preds.shape[-1])  # (b, l, n_patch_latens + 1 + n_patches, patch_size**2 * 3)
+            obs_preds = obs_preds[:, :, (self.n_patch_latents+n_obs_tokens):]  # (b, l, n_patches, patch_size**2 * 3)
 
             if self.fwd_pred_hand:
                 obs_pred_hand = self.decoder_embed(x[:, :, obs_hand_query_token_start_i:(obs_hand_query_token_start_i + self.n_patch_latents + n_obs_tokens)])

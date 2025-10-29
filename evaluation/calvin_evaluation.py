@@ -157,7 +157,7 @@ class GR1CalvinEvaluation(CalvinBaseModel):
         state_tensor = torch.stack(self.state_list, dim=0)  # (l, act_dim)
         gripper_state_data = - torch.ones((1, self.seq_len)).float()
         gripper_state_data[0, :buffer_len] = state_tensor[:, 6]
-        gripper_state_data = (gripper_state_data + 1.0) / 2
+        gripper_state_data = (gripper_state_data + 1.0) / 2 # since gripper states are in {-1, +1}, this maps them to {0, 1}.
         gripper_state_data = gripper_state_data.long()
         gripper_state_data = F.one_hot(gripper_state_data, num_classes=2).float()  # (b, l, 2)
         arm_state_data = torch.zeros((1, self.seq_len, self.act_dim - 1)).float()  # (b, l, act_dim - 1)
@@ -189,7 +189,7 @@ class GR1CalvinEvaluation(CalvinBaseModel):
         # Arm action
         arm_action_preds = prediction['arm_action_preds']  # (1, l, act_dim - 1)
         arm_action_preds = arm_action_preds.view(-1, self.act_dim - 1)  # (l, act_dim - 1)
-        arm_action_preds = arm_action_preds[attention_mask.flatten() > 0]
+        arm_action_preds = arm_action_preds[attention_mask.flatten() > 0] # Filter out “empty” timesteps
 
         # Gripper action
         gripper_action_preds = prediction['gripper_action_preds']  # (1, l, 1)
@@ -199,10 +199,10 @@ class GR1CalvinEvaluation(CalvinBaseModel):
         # Use the last action
         arm_action_pred = arm_action_preds[-1]  # (act_dim - 1, )
         gripper_action_pred = gripper_action_preds[-1:]  # (1, )
-        gripper_action_pred = torch.nn.Sigmoid()(gripper_action_pred)
+        gripper_action_pred = torch.nn.Sigmoid()(gripper_action_pred) # net produces logit, use sigmoid
         gripper_action_pred = gripper_action_pred > 0.5
         gripper_action_pred = gripper_action_pred.int().float()
-        gripper_action_pred = gripper_action_pred * 2.0 - 1.0
+        gripper_action_pred = gripper_action_pred * 2.0 - 1.0 # gripper remapped in {-1, +1}
         action_pred = torch.cat((arm_action_pred, gripper_action_pred), dim=0)  # (act_dim,)
         action_pred = action_pred.detach().cpu()
 
